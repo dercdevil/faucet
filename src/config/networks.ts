@@ -30,7 +30,7 @@ export const NETWORKS: Record<string, NetworkConfig> = {
       "https://data-seed-prebsc-1-s2.binance.org:8545/",
     ],
     blockExplorerUrls: ["https://testnet.bscscan.com/"],
-    faucetAmount: "0.003", // Más cantidad en testnet para pruebas
+    faucetAmount: "0.002", // Más cantidad en testnet para pruebas
     explorerName: "BSCScan Testnet",
   },
   mainnet: {
@@ -48,7 +48,7 @@ export const NETWORKS: Record<string, NetworkConfig> = {
       "https://bsc-dataseed1.ninicoin.io/",
     ],
     blockExplorerUrls: ["https://bscscan.com/"],
-    faucetAmount: "0.003", // Cantidad menor en mainnet
+    faucetAmount: "0.002", // Cantidad menor en mainnet
     explorerName: "BSCScan",
   },
 };
