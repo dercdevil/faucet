@@ -2,11 +2,39 @@ import Database from "better-sqlite3";
 import path from "path";
 import fs from "fs";
 
-const dbPath = path.join(process.cwd(), "faucet.db");
+// Detectar entorno serverless (Vercel, Netlify, AWS Lambda, etc.)
+const isServerless =
+  process.env.VERCEL === "1" ||
+  process.env.NETLIFY === "true" ||
+  process.env.AWS_LAMBDA_FUNCTION_NAME ||
+  process.env.LAMBDA_TASK_ROOT ||
+  process.cwd().includes("/var/task") ||
+  process.cwd().includes("/tmp");
+
+// En entornos serverless, usar /tmp que es escribible
+// En desarrollo local, usar el directorio del proyecto
+const dbPath = isServerless
+  ? path.join("/tmp", "faucet.db")
+  : path.join(process.cwd(), "faucet.db");
 
 // Función para inicializar la base de datos con permisos correctos
 function initializeDatabase(): Database {
   try {
+    console.log(`Inicializando base de datos en: ${dbPath}`);
+    console.log(`Entorno serverless: ${isServerless}`);
+    console.log(`Directorio actual: ${process.cwd()}`);
+
+    if (isServerless) {
+      console.warn(
+        "⚠️  ADVERTENCIA: En entornos serverless, la base de datos SQLite se almacena en /tmp"
+      );
+      console.warn(
+        "⚠️  Los datos se perderán cuando la función se reinicie (cold start)"
+      );
+      console.warn(
+        "⚠️  Para producción, considera usar una base de datos externa (PostgreSQL, MySQL, etc.)"
+      );
+    }
     // Verificar si el directorio existe y tiene permisos de escritura
     const dbDir = path.dirname(dbPath);
 
