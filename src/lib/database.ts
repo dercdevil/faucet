@@ -1,8 +1,61 @@
 import Database from "better-sqlite3";
 import path from "path";
+import fs from "fs";
 
 const dbPath = path.join(process.cwd(), "faucet.db");
-const db = new Database(dbPath);
+
+// Función para inicializar la base de datos con permisos correctos
+function initializeDatabase(): Database {
+  try {
+    // Verificar si el directorio existe y tiene permisos de escritura
+    const dbDir = path.dirname(dbPath);
+
+    // Crear directorio si no existe
+    if (!fs.existsSync(dbDir)) {
+      fs.mkdirSync(dbDir, { recursive: true, mode: 0o755 });
+    }
+
+    // Verificar permisos del directorio
+    try {
+      fs.accessSync(dbDir, fs.constants.W_OK);
+    } catch {
+      console.error(`No se puede escribir en el directorio: ${dbDir}`);
+      throw new Error(`Database directory is not writable: ${dbDir}`);
+    }
+
+    // Si la base de datos existe, verificar permisos
+    if (fs.existsSync(dbPath)) {
+      try {
+        fs.accessSync(dbPath, fs.constants.W_OK);
+      } catch {
+        console.error(`Base de datos de solo lectura: ${dbPath}`);
+        // Intentar cambiar permisos
+        try {
+          fs.chmodSync(dbPath, 0o644);
+          console.log(`Permisos de base de datos actualizados: ${dbPath}`);
+        } catch {
+          throw new Error(`Cannot make database writable: ${dbPath}`);
+        }
+      }
+    }
+
+    // Crear conexión a la base de datos
+    const database = new Database(dbPath);
+
+    // Configurar SQLite para mejor concurrencia
+    database.exec("PRAGMA journal_mode = WAL");
+    database.exec("PRAGMA synchronous = NORMAL");
+    database.exec("PRAGMA cache_size = 1000");
+    database.exec("PRAGMA temp_store = memory");
+
+    return database;
+  } catch (error) {
+    console.error("Error inicializando base de datos:", error);
+    throw error;
+  }
+}
+
+const db = initializeDatabase();
 
 // Crear tablas si no existen
 db.exec(`
@@ -39,6 +92,92 @@ export interface RateLimit {
   blockedUntil: string | null;
 }
 
+// Función para intentar reparar la base de datos
+function repairDatabase(): void {
+  try {
+    console.log("Intentando reparar base de datos...");
+
+    // Cerrar conexión actual si existe
+    if (db) {
+      try {
+        (db as Database & { close(): void }).close();
+      } catch {
+        // Ignorar errores al cerrar
+      }
+    }
+
+    // Verificar y corregir permisos
+    if (fs.existsSync(dbPath)) {
+      try {
+        fs.chmodSync(dbPath, 0o644);
+        console.log("Permisos de base de datos corregidos");
+      } catch {
+        console.log(
+          "No se pudieron corregir permisos, recreando base de datos..."
+        );
+        // Si no se pueden corregir permisos, eliminar y recrear
+        fs.unlinkSync(dbPath);
+      }
+    }
+
+    // Verificar permisos del directorio
+    const dbDir = path.dirname(dbPath);
+    try {
+      fs.accessSync(dbDir, fs.constants.W_OK);
+    } catch {
+      throw new Error(`Database directory is not writable: ${dbDir}`);
+    }
+  } catch (error) {
+    console.error("Error reparando base de datos:", error);
+    throw error;
+  }
+}
+
+// Función auxiliar para manejar reintentos en operaciones SQLite
+function withRetry<T>(operation: () => T, maxRetries: number = 3): T {
+  let retries = 0;
+
+  while (retries < maxRetries) {
+    try {
+      return operation();
+    } catch (error: unknown) {
+      retries++;
+      const errorCode = (error as { code?: string }).code;
+
+      if (errorCode === "SQLITE_READONLY" && retries === 1) {
+        // En el primer intento con SQLITE_READONLY, intentar reparar
+        console.log(
+          "Base de datos de solo lectura detectada, intentando reparar..."
+        );
+        try {
+          repairDatabase();
+          // Reinicializar la base de datos
+          const newDb = initializeDatabase();
+          // Reemplazar la referencia global (esto es un hack, pero necesario)
+          Object.setPrototypeOf(db, Object.getPrototypeOf(newDb));
+          Object.assign(db, newDb);
+          continue; // Reintentar la operación
+        } catch (repairError) {
+          console.error("No se pudo reparar la base de datos:", repairError);
+        }
+      }
+
+      if (
+        (errorCode === "SQLITE_BUSY" || errorCode === "SQLITE_READONLY") &&
+        retries < maxRetries
+      ) {
+        // Esperar un tiempo aleatorio antes de reintentar
+        const delay = Math.random() * 100 + 50; // 50-150ms
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw new Error("Max retries exceeded");
+}
+
 export class FaucetDB {
   static hasClaimedByIP(ip: string): boolean {
     const stmt = db.prepare(
@@ -57,8 +196,10 @@ export class FaucetDB {
   }
 
   static addClaim(ip: string, wallet: string): void {
-    const stmt = db.prepare("INSERT INTO claims (ip, wallet) VALUES (?, ?)");
-    stmt.run(ip, wallet);
+    withRetry(() => {
+      const stmt = db.prepare("INSERT INTO claims (ip, wallet) VALUES (?, ?)");
+      stmt.run(ip, wallet);
+    });
   }
 
   static getAllClaims(): Claim[] {
@@ -86,78 +227,86 @@ export class FaucetDB {
     blockedUntil?: Date;
     attempts?: number;
   } {
-    const stmt = db.prepare(
-      "SELECT * FROM rate_limits WHERE ip = ? ORDER BY lastAttempt DESC LIMIT 1"
-    );
-    const rateLimit = stmt.get(ip) as RateLimit | undefined;
+    return withRetry(() => {
+      const stmt = db.prepare(
+        "SELECT * FROM rate_limits WHERE ip = ? ORDER BY lastAttempt DESC LIMIT 1"
+      );
+      const rateLimit = stmt.get(ip) as RateLimit | undefined;
 
-    if (!rateLimit) {
-      return { allowed: true };
-    }
+      if (!rateLimit) {
+        return { allowed: true };
+      }
 
-    const now = new Date();
-    const lastAttempt = new Date(rateLimit.lastAttempt);
-    const timeDiff = now.getTime() - lastAttempt.getTime();
-    const hoursSinceLastAttempt = timeDiff / (1000 * 60 * 60);
+      const now = new Date();
+      const lastAttempt = new Date(rateLimit.lastAttempt);
+      const timeDiff = now.getTime() - lastAttempt.getTime();
+      const hoursSinceLastAttempt = timeDiff / (1000 * 60 * 60);
 
-    // If blocked, check if block period has expired
-    if (rateLimit.blockedUntil) {
-      const blockedUntil = new Date(rateLimit.blockedUntil);
-      if (now < blockedUntil) {
-        return { allowed: false, blockedUntil, attempts: rateLimit.attempts };
-      } else {
-        // Block period expired, reset
+      // If blocked, check if block period has expired
+      if (rateLimit.blockedUntil) {
+        const blockedUntil = new Date(rateLimit.blockedUntil);
+        if (now < blockedUntil) {
+          return { allowed: false, blockedUntil, attempts: rateLimit.attempts };
+        } else {
+          // Block period expired, reset
+          this.resetRateLimit(ip);
+          return { allowed: true };
+        }
+      }
+
+      // Reset attempts if more than 24 hours have passed
+      if (hoursSinceLastAttempt >= 24) {
         this.resetRateLimit(ip);
         return { allowed: true };
       }
-    }
 
-    // Reset attempts if more than 24 hours have passed
-    if (hoursSinceLastAttempt >= 24) {
-      this.resetRateLimit(ip);
-      return { allowed: true };
-    }
+      // Check if too many attempts
+      if (rateLimit.attempts >= 5) {
+        // Block for 1 hour
+        const blockedUntil = new Date(now.getTime() + 60 * 60 * 1000);
+        this.blockIP(ip, blockedUntil);
+        return { allowed: false, blockedUntil, attempts: rateLimit.attempts };
+      }
 
-    // Check if too many attempts
-    if (rateLimit.attempts >= 5) {
-      // Block for 1 hour
-      const blockedUntil = new Date(now.getTime() + 60 * 60 * 1000);
-      this.blockIP(ip, blockedUntil);
-      return { allowed: false, blockedUntil, attempts: rateLimit.attempts };
-    }
-
-    return { allowed: true, attempts: rateLimit.attempts };
+      return { allowed: true, attempts: rateLimit.attempts };
+    });
   }
 
   static recordAttempt(ip: string): void {
-    const stmt = db.prepare(
-      "SELECT * FROM rate_limits WHERE ip = ? ORDER BY lastAttempt DESC LIMIT 1"
-    );
-    const existing = stmt.get(ip) as RateLimit | undefined;
+    withRetry(() => {
+      const stmt = db.prepare(
+        "SELECT * FROM rate_limits WHERE ip = ? ORDER BY lastAttempt DESC LIMIT 1"
+      );
+      const existing = stmt.get(ip) as RateLimit | undefined;
 
-    if (existing) {
-      const updateStmt = db.prepare(
-        "UPDATE rate_limits SET attempts = attempts + 1, lastAttempt = CURRENT_TIMESTAMP WHERE ip = ? AND id = ?"
-      );
-      updateStmt.run(ip, existing.id);
-    } else {
-      const insertStmt = db.prepare(
-        "INSERT INTO rate_limits (ip, attempts) VALUES (?, 1)"
-      );
-      insertStmt.run(ip);
-    }
+      if (existing) {
+        const updateStmt = db.prepare(
+          "UPDATE rate_limits SET attempts = attempts + 1, lastAttempt = CURRENT_TIMESTAMP WHERE ip = ? AND id = ?"
+        );
+        updateStmt.run(ip, existing.id);
+      } else {
+        const insertStmt = db.prepare(
+          "INSERT INTO rate_limits (ip, attempts) VALUES (?, 1)"
+        );
+        insertStmt.run(ip);
+      }
+    });
   }
 
   static blockIP(ip: string, blockedUntil: Date): void {
-    const stmt = db.prepare(
-      "UPDATE rate_limits SET blockedUntil = ? WHERE ip = ?"
-    );
-    stmt.run(blockedUntil.toISOString(), ip);
+    withRetry(() => {
+      const stmt = db.prepare(
+        "UPDATE rate_limits SET blockedUntil = ? WHERE ip = ?"
+      );
+      stmt.run(blockedUntil.toISOString(), ip);
+    });
   }
 
   static resetRateLimit(ip: string): void {
-    const stmt = db.prepare("DELETE FROM rate_limits WHERE ip = ?");
-    stmt.run(ip);
+    withRetry(() => {
+      const stmt = db.prepare("DELETE FROM rate_limits WHERE ip = ?");
+      stmt.run(ip);
+    });
   }
 
   static getRateLimitInfo(ip: string): RateLimit | null {
